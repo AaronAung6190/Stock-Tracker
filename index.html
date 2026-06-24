@@ -14,12 +14,13 @@
 
   <style>
     *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
-    body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif;background:#f5f6fa;overscroll-behavior:none;}
+    html,body,#root{height:100%;width:100%;overflow:hidden;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif;background:#f5f6fa;overscroll-behavior:none;position:fixed;top:0;left:0;right:0;bottom:0;}
     input,button,select{font-family:inherit;}
     button{cursor:pointer;}
     /* Safe area support for iPhone notch/home bar */
-    .safe-top{padding-top:env(safe-area-inset-top,0px);}
-    .safe-bot{padding-bottom:env(safe-area-inset-bottom,16px);}
+    .safe-top{padding-top:max(env(safe-area-inset-top,0px),44px);}
+    .safe-bot{padding-bottom:env(safe-area-inset-bottom,8px);}
   </style>
 
   <!-- React + Babel from CDN -->
@@ -1010,15 +1011,15 @@ function App(){
   if(selected) return <StockDetail tickerId={selected} prices={prices} onBack={()=>setSelected(null)}/>;
 
   return(
-    <div style={{display:"flex",flexDirection:"column",height:"100vh",background:C.bg,overflow:"hidden"}}>
-      <div style={{flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch"}}>
+    <div style={{display:"flex",flexDirection:"column",height:"100%",width:"100%",background:C.bg,overflow:"hidden",position:"fixed",top:0,left:0,right:0,bottom:0}}>
+      <div style={{flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain"}}>
         {mainTab==="watchlist"?<WatchlistScreen prices={prices} onSelect={setSelected}/>
         :mainTab==="portfolio"?<PortfolioScreen prices={prices} onSelectTicker={setSelected}/>
         :mainTab==="gold"?<SwanBullionScreen sharedBarPrice={swanBarPrice} onPriceUpdate={setSwanBarPrice}/>
         :mainTab==="savings"?<SavingsScreen/>
         :<TotalPortfolioScreen prices={prices} swanBarPrice={swanBarPrice}/>}
       </div>
-      <div style={{background:C.panel,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0}} className="safe-bot">
+      <div style={{background:C.panel,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0,minHeight:56}} className="safe-bot">
         {[{id:"watchlist",icon:"📈",label:"Watchlist"},{id:"portfolio",icon:"💼",label:"Portfolio"},{id:"gold",icon:"🥇",label:"Gold"},{id:"savings",icon:"🏦",label:"Savings"},{id:"total",icon:"🌐",label:"Total"}].map(tab=>(
           <button key={tab.id} onClick={()=>setMainTab(tab.id)} style={{flex:1,background:"transparent",border:"none",padding:"10px 0 4px",display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
             <span style={{fontSize:20}}>{tab.icon}</span>
