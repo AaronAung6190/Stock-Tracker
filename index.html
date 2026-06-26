@@ -93,11 +93,24 @@ function useLivePrices() {
 
   const [prices,setPrices]=useState(()=>Object.fromEntries(TICKERS.map(t=>[t.id,makeBase(t.basePrice)])));
 
-  // When AUD/USD loads, re-base NVDA price in AUD
+  // When AUD/USD loads, re-base NVDA open/base price only — preserve live current price
+  const nvdaBaseSet = useRef(false);
   useEffect(()=>{
-    if(!audUsd) return;
+    if(!audUsd || nvdaBaseSet.current) return;
+    nvdaBaseSet.current = true; // only re-base once on first load
     const nvdaAUD = +(NVDA_USD_BASE / audUsd).toFixed(3);
-    setPrices(prev=>({...prev, NVDA:{...makeBase(nvdaAUD), audUsd}}));
+    setPrices(prev=>({
+      ...prev,
+      NVDA:{
+        ...prev.NVDA,           // keep all existing live state
+        open: nvdaAUD,          // update open price
+        current: nvdaAUD,       // update current price
+        prev: nvdaAUD,
+        high: +(nvdaAUD*1.012).toFixed(3),
+        low:  +(nvdaAUD*0.988).toFixed(3),
+        audUsd,                 // store rate for display
+      }
+    }));
   },[audUsd]);
 
   useEffect(()=>{
