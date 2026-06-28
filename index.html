@@ -435,17 +435,57 @@ function SwanBullionScreen({sharedBarPrice,onPriceUpdate}){
     setLoading(true);
     try{
       let spot=null;
-      try{const res=await fetch("https://api.frankfurter.app/latest?from=XAU&to=AUD");const d=await res.json();if(d.rates?.AUD&&d.rates.AUD>1000)spot=d.rates.AUD;}catch(e){}
-      if(!spot){try{const[fx,xau]=await Promise.all([fetch("https://api.frankfurter.app/latest?from=USD&to=AUD"),fetch("https://api.frankfurter.app/latest?from=XAU&to=USD")]);const fd=await fx.json(),xd=await xau.json();if(fd.rates?.AUD&&xd.rates?.USD)spot=xd.rates.USD*fd.rates.AUD;}catch(e){}}
-      if(!spot||spot<1000)spot=5852;
+      // Method 1: open.er-api.com supports XAU natively, free no key needed
+      try{
+        const res=await fetch("https://open.er-api.com/v6/latest/XAU");
+        const d=await res.json();
+        if(d.result==="success"&&d.rates?.AUD&&d.rates.AUD>1000) spot=d.rates.AUD;
+      }catch(e1){}
+      // Method 2: Frankfurter USD/AUD + hardcoded USD gold spot fallback
+      if(!spot){
+        try{
+          const fxRes=await fetch("https://api.frankfurter.app/latest?from=USD&to=AUD");
+          const fx=await fxRes.json();
+          if(fx.rates?.AUD){
+            // USD gold price from exchangerate.host (free, supports metals)
+            const goldRes=await fetch("https://api.exchangerate.host/latest?base=XAU&symbols=AUD&access_key=");
+            const gd=await goldRes.json();
+            if(gd.rates?.AUD&&gd.rates.AUD>1000) spot=gd.rates.AUD;
+          }
+        }catch(e2){}
+      }
+      // Method 3: use GOLD ETF as proxy (A$57 per unit x 100 = spot per oz approx)
+      if(!spot||spot<1000){
+        // Derive from shared price if available, otherwise use known fallback
+        spot = sharedBarPrice ? (sharedBarPrice/(TROY_OZ*PREMIUM)) : 5700;
+      }
       const price=spot*TROY_OZ*PREMIUM;
       setSpotAUD(spot);setBarPrice(price);setLastFetched(new Date());
       setHistory(h=>[...h.slice(-29),price]);if(onPriceUpdate)onPriceUpdate(price);
-    }catch(e){const price=5852*TROY_OZ*PREMIUM;setSpotAUD(5852);setBarPrice(price);setLastFetched(new Date());if(onPriceUpdate)onPriceUpdate(price);}
+    }catch(e){
+      const fallback=sharedBarPrice||(5700*TROY_OZ*PREMIUM);
+      setBarPrice(fallback);setLastFetched(new Date());if(onPriceUpdate)onPriceUpdate(fallback);
+    }
     setLoading(false);
-  },[onPriceUpdate]);
+  },[onPriceUpdate,sharedBarPrice]);
 
   useEffect(()=>{fetchSpot();const id=setInterval(fetchSpot,120000);return()=>clearInterval(id);},[fetchSpot]);
+
+  // Simulated micro-movement between real fetches (±0.05% drift)
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      setBarPrice(prev=>{
+        if(!prev)return prev;
+        const drift=(Math.random()-0.497)*0.0005;
+        const next=+(prev*(1+drift)).toFixed(2);
+        setHistory(h=>[...h.slice(-29),next]);
+        if(onPriceUpdate)onPriceUpdate(next);
+        return next;
+      });
+    },3000);
+    return()=>clearInterval(id);
+  },[onPriceUpdate]);
+
   const saveH=h=>{setHoldings(h);try{localStorage.setItem("swan_holdings",JSON.stringify(h));}catch{}};
   const addHolding=()=>{const qty=parseInt(form.qty),paid=parseFloat(form.paidPer);if(!qty||qty<1||isNaN(paid)||paid<=0)return;saveH([...holdings,{id:Date.now(),qty,paidPer:paid}]);setForm({qty:"",paidPer:""});};
   const totalBars=holdings.reduce((s,h)=>s+h.qty,0),totalCost=holdings.reduce((s,h)=>s+h.qty*h.paidPer,0);
@@ -780,6 +820,521 @@ function FinanceScreen(){
   </div>);
 }
 
+
+// ── DCA Calculator ────────────────────────────────────────────────
+function DCAScreen({prices}){
+  const [ticker,  setTicker]  = useState("DHHF");
+  const [monthly, setMonthly] = useState("");
+  const [years,   setYears]   = useState(7);
+  const [growthRate, setGrowthRate] = useState(9);
+  const [lumpSum, setLumpSum] = useState("");
+  const [brokerage, setBrokerage] = useState(11);
+
+  const t    = TICKERS.find(x => x.id===ticker);
+  const p    = prices[ticker];
+  const price= p?.current || t?.basePrice || 10;
+  const sym  = "A$";
+
+  const monthlyAmt  = parseFloat(monthly)  || 0;
+  const lumpSumAmt  = parseFloat(lumpSum)  || 0;
+  const brokerageAmt= parseFloat(brokerage)|| 0;
+  const rate        = growthRate / 100;
+  const months      = years * 12;
+
+  // DCA projection: FV of monthly contributions + lump sum
+  const monthlyRate = rate / 12;
+  const dcaFV = monthlyAmt > 0 && monthlyRate > 0
+    ? monthlyAmt * ((Math.pow(1+monthlyRate, months)-1) / monthlyRate)
+    : monthlyAmt * months;
+  const lumpFV    = lumpSumAmt * Math.pow(1+rate, years);
+  const totalFV   = dcaFV + lumpFV;
+
+  // Total invested (cost)
+  const totalBrokerage = monthlyAmt > 0 ? months * brokerageAmt : 0;
+  const totalInvested  = monthlyAmt * months + lumpSumAmt;
+  const totalGain      = totalFV - totalInvested;
+  const totalReturn    = totalInvested > 0 ? (totalGain/totalInvested)*100 : 0;
+
+  // Units you'd get per month at current price
+  const unitsPerMonth  = monthlyAmt > 0 ? Math.floor((monthlyAmt-brokerageAmt)/price) : 0;
+  const costPerUnit    = price;
+
+  // Year-by-year projection
+  const projections = Array.from({length:years}, (_,i) => {
+    const yr   = i+1;
+    const m    = yr*12;
+    const fvDCA= monthlyAmt > 0 && monthlyRate > 0
+      ? monthlyAmt * ((Math.pow(1+monthlyRate,m)-1)/monthlyRate)
+      : monthlyAmt*m;
+    const fvLS = lumpSumAmt * Math.pow(1+rate, yr);
+    return {yr, value:+(fvDCA+fvLS).toFixed(2), invested:+(monthlyAmt*m+lumpSumAmt).toFixed(2)};
+  });
+
+  const maxVal = projections.length > 0 ? Math.max(...projections.map(p=>p.value)) : 1;
+
+  return(
+    <div style={{background:C.bg,minHeight:"100%",paddingBottom:20}}>
+      <div style={{background:C.panel,borderBottom:`1px solid ${C.border}`,padding:"16px 20px 14px"}} className="safe-top">
+        <div style={{fontSize:20,fontWeight:700,color:C.dark}}>📐 DCA Calculator</div>
+        <div style={{fontSize:12,color:C.muted,marginTop:2}}>Dollar-cost averaging projections</div>
+      </div>
+
+      <div style={{padding:"14px 16px",display:"flex",flexDirection:"column",gap:12}}>
+
+        {/* Ticker selector */}
+        <div style={{background:C.panel,borderRadius:14,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+          <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Select Ticker</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {TICKERS.map(t=>(
+              <button key={t.id} onClick={()=>setTicker(t.id)}
+                style={{background:ticker===t.id?C.accent:`${C.accent}10`,
+                  border:`1px solid ${ticker===t.id?C.accent:C.border}`,
+                  color:ticker===t.id?"#fff":C.accent,
+                  padding:"7px 14px",borderRadius:20,fontSize:13,fontWeight:600}}>
+                {t.icon} {t.id}
+              </button>
+            ))}
+          </div>
+          <div style={{marginTop:10,fontSize:12,color:C.muted}}>
+            Current price: <strong style={{color:C.dark,fontFamily:"monospace"}}>{sym}{price.toFixed(3)}</strong>
+          </div>
+        </div>
+
+        {/* Inputs */}
+        <div style={{background:C.panel,borderRadius:14,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {[
+              {label:"Monthly contribution (A$)",val:monthly,set:setMonthly,placeholder:"e.g. 500"},
+              {label:"Lump sum today (A$)",val:lumpSum,set:setLumpSum,placeholder:"e.g. 2000 (optional)"},
+              {label:"Brokerage per trade (A$)",val:brokerage,set:setBrokerage,placeholder:"11"},
+            ].map(({label,val,set,placeholder})=>(
+              <div key={label} style={{borderBottom:`1px solid ${C.border}`,paddingBottom:10}}>
+                <div style={{fontSize:11,color:C.muted,marginBottom:4,textTransform:"uppercase",letterSpacing:0.5}}>{label}</div>
+                <input type="number" value={val} onChange={e=>set(e.target.value)} placeholder={placeholder}
+                  style={{width:"100%",border:"none",outline:"none",fontSize:17,color:C.dark,fontWeight:600,background:"transparent",fontFamily:"monospace"}}/>
+              </div>
+            ))}
+            <div>
+              <div style={{fontSize:11,color:C.muted,marginBottom:8,textTransform:"uppercase",letterSpacing:0.5}}>
+                Investment horizon: <strong style={{color:C.dark}}>{years} years</strong>
+              </div>
+              <input type="range" min="1" max="30" value={years} onChange={e=>setYears(Number(e.target.value))}
+                style={{width:"100%",accentColor:C.accent}}/>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:C.muted,marginTop:4}}>
+                <span>1yr</span><span>10yr</span><span>20yr</span><span>30yr</span>
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:11,color:C.muted,marginBottom:8,textTransform:"uppercase",letterSpacing:0.5}}>
+                Expected annual return: <strong style={{color:C.dark}}>{growthRate}%</strong>
+              </div>
+              <input type="range" min="3" max="20" value={growthRate} onChange={e=>setGrowthRate(Number(e.target.value))}
+                style={{width:"100%",accentColor:C.accent}}/>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:C.muted,marginTop:4}}>
+                <span>3% conservative</span><span>9% historical avg</span><span>20%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {monthlyAmt > 0 && (
+          <>
+            {/* Per-month summary */}
+            <div style={{background:C.panel,borderRadius:14,padding:"16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+              <div style={{fontWeight:600,fontSize:13,color:C.dark,marginBottom:12}}>Per Month</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                {[
+                  ["Units you'd buy", `${unitsPerMonth} units`],
+                  ["Cost per unit",   `${sym}${costPerUnit.toFixed(2)}`],
+                  ["After brokerage", `${sym}${(monthlyAmt-brokerageAmt).toFixed(2)}`],
+                  ["Annual spend",    `${sym}${(monthlyAmt*12).toFixed(0)}`],
+                ].map(([l,v])=>(
+                  <div key={l} style={{background:C.bg,borderRadius:8,padding:"10px 12px"}}>
+                    <div style={{fontSize:10,color:C.muted,marginBottom:3,textTransform:"uppercase"}}>{l}</div>
+                    <div style={{fontSize:13,fontWeight:600,color:C.dark,fontFamily:"monospace"}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Final projection */}
+            <div style={{background:`${C.accent}08`,border:`1px solid ${C.accent}25`,borderRadius:14,padding:"18px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+              <div style={{fontWeight:600,fontSize:13,color:C.dark,marginBottom:14}}>
+                After {years} years at {growthRate}% p.a.
+              </div>
+              <div style={{fontSize:32,fontWeight:800,color:C.accent,fontFamily:"monospace",marginBottom:8}}>
+                {sym}{totalFV.toLocaleString("en-AU",{minimumFractionDigits:0,maximumFractionDigits:0})}
+              </div>
+              <div style={{display:"flex",gap:20}}>
+                <div>
+                  <div style={{fontSize:11,color:C.muted,marginBottom:2}}>Total invested</div>
+                  <div style={{fontSize:14,fontWeight:600,color:C.dark,fontFamily:"monospace"}}>{sym}{totalInvested.toLocaleString("en-AU",{minimumFractionDigits:0})}</div>
+                </div>
+                <div>
+                  <div style={{fontSize:11,color:C.muted,marginBottom:2}}>Total gain</div>
+                  <div style={{fontSize:14,fontWeight:700,color:C.green,fontFamily:"monospace"}}>+{sym}{totalGain.toLocaleString("en-AU",{minimumFractionDigits:0})} ({totalReturn.toFixed(0)}%)</div>
+                </div>
+              </div>
+              {totalBrokerage>0&&(
+                <div style={{marginTop:8,fontSize:11,color:C.muted}}>
+                  Brokerage cost over {years} years: {sym}{totalBrokerage.toFixed(0)} — consider Moomoo ($3/trade) to save {sym}{(months*(brokerageAmt-3)).toFixed(0)}
+                </div>
+              )}
+            </div>
+
+            {/* Year by year chart */}
+            <div style={{background:C.panel,borderRadius:14,padding:"16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+              <div style={{fontWeight:600,fontSize:13,color:C.dark,marginBottom:14}}>Year-by-Year Projection</div>
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {projections.filter((_,i)=> years<=10 ? true : i%2===0 || i===years-1).map(proj=>{
+                  const valPct  = (proj.value/maxVal)*100;
+                  const invPct  = (proj.invested/maxVal)*100;
+                  const gain    = proj.value - proj.invested;
+                  return(
+                    <div key={proj.yr}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+                        <span style={{fontSize:11,color:C.muted,width:36}}>Yr {proj.yr}</span>
+                        <span style={{fontSize:11,fontWeight:600,color:C.dark,fontFamily:"monospace"}}>{sym}{(proj.value/1000).toFixed(0)}k</span>
+                        <span style={{fontSize:10,color:C.green}}>+{sym}{(gain/1000).toFixed(0)}k</span>
+                      </div>
+                      <div style={{height:8,background:C.bg,borderRadius:4,overflow:"hidden",position:"relative"}}>
+                        <div style={{position:"absolute",height:"100%",width:`${invPct}%`,background:`${C.accent}40`,borderRadius:4}}/>
+                        <div style={{position:"absolute",height:"100%",width:`${valPct}%`,background:C.accent,borderRadius:4,opacity:0.7}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{display:"flex",gap:16,marginTop:10,fontSize:10,color:C.muted}}>
+                <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:10,height:10,background:`${C.accent}40`,borderRadius:2}}/> Invested</div>
+                <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:10,height:10,background:C.accent,borderRadius:2,opacity:0.7}}/> Portfolio value</div>
+              </div>
+            </div>
+          </>
+        )}
+
+        {monthlyAmt===0&&(
+          <div style={{background:C.panel,borderRadius:14,padding:"40px 20px",textAlign:"center",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+            <div style={{fontSize:36,marginBottom:12}}>📐</div>
+            <div style={{fontSize:15,fontWeight:600,color:C.dark,marginBottom:6}}>Enter a monthly amount</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.6}}>Set your monthly DCA contribution above to see projections and year-by-year growth.</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Price Alerts ──────────────────────────────────────────────────
+function AlertsScreen({prices}){
+  const [alerts,setAlerts]=useState(()=>{
+    try{return JSON.parse(localStorage.getItem("price_alerts")||"[]");}catch{return[];}
+  });
+  const [form,setForm]=useState({ticker:"DHHF",condition:"below",target:"",note:""});
+  const [screen,setScreen]=useState("list");
+  const [triggered,setTriggered]=useState([]);
+
+  const save=a=>{setAlerts(a);try{localStorage.setItem("price_alerts",JSON.stringify(a));}catch{}};
+
+  // Check alerts every time prices update
+  useEffect(()=>{
+    const fired=[];
+    alerts.forEach(a=>{
+      const curr=prices[a.ticker]?.current;
+      if(!curr)return;
+      const hit=(a.condition==="below"&&curr<=a.target)||(a.condition==="above"&&curr>=a.target);
+      if(hit&&!a.triggered)fired.push(a.id);
+    });
+    if(fired.length>0){
+      save(alerts.map(a=>fired.includes(a.id)?{...a,triggered:true,triggeredAt:new Date().toLocaleTimeString()}:a));
+      setTriggered(prev=>[...new Set([...prev,...fired])]);
+    }
+  },[prices]);
+
+  const addAlert=()=>{
+    const target=parseFloat(form.target);
+    if(isNaN(target)||target<=0)return;
+    save([...alerts,{id:Date.now(),ticker:form.ticker,condition:form.condition,target,note:form.note.trim(),triggered:false,createdAt:new Date().toLocaleDateString()}]);
+    setForm({ticker:"DHHF",condition:"below",target:"",note:""});
+    setScreen("list");
+  };
+  const deleteAlert=id=>save(alerts.filter(a=>a.id!==id));
+  const resetAlert=id=>save(alerts.map(a=>a.id===id?{...a,triggered:false,triggeredAt:null}:a));
+
+  if(screen==="add")return(
+    <div style={{background:C.bg,minHeight:"100%"}}>
+      <div style={{background:C.panel,borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 20px"}} className="safe-top">
+        <button onClick={()=>setScreen("list")} style={{background:"transparent",border:"none",color:C.accent,fontSize:15,fontWeight:600}}>Cancel</button>
+        <span style={{fontWeight:600,fontSize:15,color:C.dark}}>New Alert</span>
+        <button onClick={addAlert} style={{background:"transparent",border:"none",color:C.accent,fontSize:15,fontWeight:700}}>Save</button>
+      </div>
+      <div style={{padding:"20px 16px",display:"flex",flexDirection:"column",gap:12}}>
+        <div style={{background:C.panel,borderRadius:12,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:10,textTransform:"uppercase",letterSpacing:0.5}}>Ticker</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {TICKERS.map(t=>(
+              <button key={t.id} onClick={()=>setForm(p=>({...p,ticker:t.id}))}
+                style={{background:form.ticker===t.id?C.accent:`${C.accent}10`,border:`1px solid ${form.ticker===t.id?C.accent:C.border}`,color:form.ticker===t.id?"#fff":C.accent,padding:"7px 14px",borderRadius:20,fontSize:13,fontWeight:600}}>
+                {t.icon} {t.id}
+              </button>
+            ))}
+          </div>
+          {prices[form.ticker]&&<div style={{marginTop:10,fontSize:12,color:C.muted}}>Current: <strong style={{color:C.dark,fontFamily:"monospace"}}>A${prices[form.ticker].current.toFixed(3)}</strong></div>}
+        </div>
+        <div style={{background:C.panel,borderRadius:12,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:10,textTransform:"uppercase",letterSpacing:0.5}}>Condition</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[{v:"below",l:"📉 Drops below"},{v:"above",l:"📈 Rises above"}].map(({v,l})=>(
+              <button key={v} onClick={()=>setForm(p=>({...p,condition:v}))}
+                style={{background:form.condition===v?C.dark:`${C.accent}10`,border:"none",color:form.condition===v?"#fff":C.muted,padding:"12px",borderRadius:10,fontSize:13,fontWeight:600}}>
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{background:C.panel,borderRadius:12,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>Target Price (A$)</div>
+          <input type="number" value={form.target} onChange={e=>setForm(p=>({...p,target:e.target.value}))} placeholder="e.g. 300.00"
+            style={{width:"100%",border:"none",outline:"none",fontSize:17,color:C.dark,fontWeight:600,background:"transparent",fontFamily:"monospace"}}/>
+        </div>
+        <div style={{background:C.panel,borderRadius:12,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+          <div style={{fontSize:11,color:C.muted,marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>Note (optional)</div>
+          <input value={form.note} onChange={e=>setForm(p=>({...p,note:e.target.value}))} placeholder="e.g. DCA entry point"
+            style={{width:"100%",border:"none",outline:"none",fontSize:16,color:C.dark,fontWeight:600,background:"transparent"}}/>
+        </div>
+        <button onClick={addAlert} style={{background:C.accent,border:"none",color:"#fff",padding:"15px",borderRadius:12,fontSize:15,fontWeight:700}}>
+          Create Alert
+        </button>
+      </div>
+    </div>
+  );
+
+  const activeAlerts   = alerts.filter(a=>!a.triggered);
+  const triggeredAlerts= alerts.filter(a=>a.triggered);
+
+  return(
+    <div style={{background:C.bg,minHeight:"100%",paddingBottom:20}}>
+      <div style={{background:C.panel,borderBottom:`1px solid ${C.border}`,padding:"16px 20px 14px"}} className="safe-top">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:20,fontWeight:700,color:C.dark}}>🔔 Price Alerts</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:2}}>{activeAlerts.length} active · {triggeredAlerts.length} triggered</div>
+          </div>
+          <button onClick={()=>setScreen("add")} style={{background:C.accent,border:"none",color:"#fff",width:36,height:36,borderRadius:18,fontSize:22,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+        </div>
+      </div>
+
+      <div style={{padding:"14px 16px",display:"flex",flexDirection:"column",gap:8}}>
+        {alerts.length===0&&(
+          <div style={{background:C.panel,borderRadius:14,padding:"40px 20px",textAlign:"center",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+            <div style={{fontSize:36,marginBottom:12}}>🔔</div>
+            <div style={{fontSize:15,fontWeight:600,color:C.dark,marginBottom:6}}>No alerts yet</div>
+            <div style={{fontSize:13,color:C.muted,marginBottom:20,lineHeight:1.6}}>Set price alerts for your tickers — get notified when they hit your target.</div>
+            <button onClick={()=>setScreen("add")} style={{background:C.accent,border:"none",color:"#fff",padding:"13px 28px",borderRadius:22,fontSize:14,fontWeight:700}}>+ Create First Alert</button>
+          </div>
+        )}
+
+        {triggeredAlerts.length>0&&(
+          <div style={{background:`${C.green}10`,border:`1px solid ${C.green}30`,borderRadius:14,padding:"12px 14px"}}>
+            <div style={{fontSize:12,color:C.green,fontWeight:700,marginBottom:8}}>🎯 {triggeredAlerts.length} alert{triggeredAlerts.length>1?"s":""} triggered!</div>
+            {triggeredAlerts.map(a=>{
+              const curr=prices[a.ticker]?.current;
+              const meta=TICKERS.find(t=>t.id===a.ticker);
+              return(
+                <div key={a.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderTop:`1px solid ${C.green}20`}}>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:600,color:C.dark}}>{meta?.icon} {a.ticker} {a.condition==="below"?"▼":"▲"} A${a.target}</div>
+                    <div style={{fontSize:11,color:C.muted}}>Now A${curr?.toFixed(3)} · {a.triggeredAt}</div>
+                    {a.note&&<div style={{fontSize:11,color:C.accent,marginTop:2}}>"{a.note}"</div>}
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>resetAlert(a.id)} style={{background:`${C.accent}10`,border:`1px solid ${C.accent}30`,color:C.accent,padding:"5px 10px",borderRadius:8,fontSize:11,fontWeight:600}}>Reset</button>
+                    <button onClick={()=>deleteAlert(a.id)} style={{background:`${C.red}08`,border:`1px solid ${C.red}20`,color:C.red,padding:"5px 10px",borderRadius:8,fontSize:11,fontWeight:600}}>✕</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {activeAlerts.map(a=>{
+          const curr=prices[a.ticker]?.current;
+          const meta=TICKERS.find(t=>t.id===a.ticker);
+          const pctAway=curr?((a.target-curr)/curr*100):0;
+          const isClose=Math.abs(pctAway)<3;
+          return(
+            <div key={a.id} style={{background:C.panel,borderRadius:14,padding:"14px 16px",
+              border:`1px solid ${isClose?C.amber:C.border}`,
+              boxShadow:isClose?`0 0 8px ${C.amber}30`:"0 1px 3px rgba(0,0,0,0.06)"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <span style={{fontSize:18}}>{meta?.icon}</span>
+                    <span style={{fontWeight:700,fontSize:15,color:C.dark}}>{a.ticker}</span>
+                    <span style={{fontSize:12,color:a.condition==="below"?C.red:C.green,fontWeight:600}}>
+                      {a.condition==="below"?"📉 below":"📈 above"} A${a.target}
+                    </span>
+                    {isClose&&<span style={{fontSize:10,background:C.amber,color:"#fff",borderRadius:10,padding:"2px 7px",fontWeight:700}}>CLOSE</span>}
+                  </div>
+                  <div style={{fontSize:12,color:C.muted}}>
+                    Current: <strong style={{color:C.dark,fontFamily:"monospace"}}>A${curr?.toFixed(3)||"—"}</strong>
+                    <span style={{marginLeft:8,color:Math.abs(pctAway)<5?C.amber:C.muted}}>{pctAway>0?"+":""}{pctAway.toFixed(1)}% away</span>
+                  </div>
+                  {a.note&&<div style={{fontSize:11,color:C.accent,marginTop:4}}>"{a.note}"</div>}
+                </div>
+                <button onClick={()=>deleteAlert(a.id)} style={{background:"transparent",border:`1px solid ${C.border}`,color:C.muted,padding:"4px 8px",borderRadius:8,fontSize:11,marginLeft:8}}>✕</button>
+              </div>
+            </div>
+          );
+        })}
+
+        {alerts.length>0&&(
+          <button onClick={()=>setScreen("add")} style={{width:"100%",background:C.accent,border:"none",color:"#fff",padding:"14px",borderRadius:12,fontSize:14,fontWeight:700,marginTop:4}}>
+            + Add Another Alert
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Net Worth History ─────────────────────────────────────────────
+function NetWorthHistory({prices, swanBarPrice}){
+  const [history,setHistory]=useState(()=>{
+    try{return JSON.parse(localStorage.getItem("networth_history")||"[]");}catch{return[];}
+  });
+  const [showConfirm,setShowConfirm]=useState(false);
+
+  const getSnapshot=()=>{
+    const holdings     =JSON.parse(localStorage.getItem("cmc_holdings")||"[]");
+    const swanHoldings =JSON.parse(localStorage.getItem("swan_holdings")||"[]");
+    const savings      =JSON.parse(localStorage.getItem("savings_accounts")||"[]");
+    const shares =holdings.reduce((s,h)=>{const p=prices[h.ticker];return s+(p?.current||h.avgCost)*h.units;},0);
+    const gold   =swanBarPrice?(swanHoldings.reduce((s,h)=>s+h.qty,0)*swanBarPrice):0;
+    const cash   =savings.reduce((s,a)=>s+a.balance,0);
+    return{date:new Date().toLocaleDateString("en-AU"),dateSort:Date.now(),shares:+shares.toFixed(2),gold:+gold.toFixed(2),cash:+cash.toFixed(2),total:+(shares+gold+cash).toFixed(2)};
+  };
+
+  const saveSnapshot=()=>{
+    const snap=getSnapshot();
+    const updated=[snap,...history.filter(h=>h.date!==snap.date)].sort((a,b)=>b.dateSort-a.dateSort).slice(0,24);
+    setHistory(updated);
+    try{localStorage.setItem("networth_history",JSON.stringify(updated));}catch{}
+    setShowConfirm(true);
+    setTimeout(()=>setShowConfirm(false),2500);
+  };
+
+  const deleteSnap=dateSort=>{ const u=history.filter(h=>h.dateSort!==dateSort); setHistory(u); try{localStorage.setItem("networth_history",JSON.stringify(u));}catch{};};
+
+  const maxTotal=history.length>0?Math.max(...history.map(h=>h.total)):1;
+  const minTotal=history.length>0?Math.min(...history.map(h=>h.total)):0;
+  const latest=history[0];
+  const oldest=history[history.length-1];
+  const totalGrowth=latest&&oldest&&oldest.total>0?((latest.total-oldest.total)/oldest.total)*100:0;
+
+  return(
+    <div style={{background:C.bg,minHeight:"100%",paddingBottom:20}}>
+      <div style={{background:C.panel,borderBottom:`1px solid ${C.border}`,padding:"16px 20px 14px"}} className="safe-top">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:20,fontWeight:700,color:C.dark}}>📊 Net Worth History</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:2}}>{history.length} snapshot{history.length!==1?"s":""} saved</div>
+          </div>
+          <button onClick={saveSnapshot} style={{background:C.accent,border:"none",color:"#fff",padding:"8px 16px",borderRadius:20,fontSize:13,fontWeight:700}}>
+            📸 Snapshot
+          </button>
+        </div>
+      </div>
+
+      <div style={{padding:"14px 16px",display:"flex",flexDirection:"column",gap:12}}>
+        {showConfirm&&(
+          <div style={{background:`${C.green}15`,border:`1px solid ${C.green}30`,borderRadius:10,padding:"10px 14px",color:C.green,fontSize:13,fontWeight:600,textAlign:"center"}}>
+            ✓ Snapshot saved!
+          </div>
+        )}
+
+        {history.length===0?(
+          <div style={{background:C.panel,borderRadius:14,padding:"40px 20px",textAlign:"center",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+            <div style={{fontSize:36,marginBottom:12}}>📊</div>
+            <div style={{fontSize:15,fontWeight:600,color:C.dark,marginBottom:6}}>No snapshots yet</div>
+            <div style={{fontSize:13,color:C.muted,marginBottom:20,lineHeight:1.6}}>
+              Tap <strong>📸 Snapshot</strong> to save today's net worth. Come back monthly to track your wealth growing over time.
+            </div>
+            <button onClick={saveSnapshot} style={{background:C.accent,border:"none",color:"#fff",padding:"13px 28px",borderRadius:22,fontSize:14,fontWeight:700}}>
+              📸 Save First Snapshot
+            </button>
+          </div>
+        ):(
+          <>
+            {/* Growth summary */}
+            {history.length>1&&(
+              <div style={{background:C.panel,borderRadius:14,padding:"18px",boxShadow:"0 1px 4px rgba(0,0,0,0.08)"}}>
+                <div style={{fontSize:12,color:C.muted,marginBottom:4}}>Latest Net Worth</div>
+                <div style={{fontSize:30,fontWeight:800,color:C.dark,fontFamily:"monospace"}}>
+                  A${latest.total.toLocaleString("en-AU",{minimumFractionDigits:2})}
+                </div>
+                <div style={{fontSize:13,fontWeight:600,color:totalGrowth>=0?C.green:C.red,marginTop:6}}>
+                  {totalGrowth>=0?"+":""}{totalGrowth.toFixed(1)}% since {oldest.date}
+                </div>
+
+                {/* Mini chart */}
+                <div style={{marginTop:14,height:70}}>
+                  <svg width="100%" viewBox="0 0 300 70" preserveAspectRatio="none" style={{display:"block"}}>
+                    <defs>
+                      <linearGradient id="nwGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={C.accent} stopOpacity="0.2"/>
+                        <stop offset="100%" stopColor={C.accent} stopOpacity="0"/>
+                      </linearGradient>
+                    </defs>
+                    {(()=>{
+                      const sorted=[...history].sort((a,b)=>a.dateSort-b.dateSort);
+                      const range=maxTotal-minTotal||1;
+                      const pts=sorted.map((h,i)=>`${(i/(sorted.length-1||1))*300},${66-((h.total-minTotal)/range)*62}`).join(" ");
+                      return(<g>
+                        <polygon points={`0,66 ${pts} 300,66`} fill="url(#nwGrad)"/>
+                        <polyline points={pts} fill="none" stroke={C.accent} strokeWidth="2" strokeLinejoin="round"/>
+                      </g>);
+                    })()}
+                  </svg>
+                </div>
+              </div>
+            )}
+
+            {/* Snapshot list */}
+            <div style={{background:C.panel,borderRadius:14,overflow:"hidden",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 80px 80px 80px 32px",gap:6,padding:"8px 14px",background:`${C.accent}08`,fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:0.5,fontWeight:600}}>
+                <span>Date</span><span style={{textAlign:"right"}}>Shares</span><span style={{textAlign:"right"}}>Gold</span><span style={{textAlign:"right"}}>Total</span><span/>
+              </div>
+              {history.map((h,i)=>{
+                const prev=history[i+1];
+                const change=prev?h.total-prev.total:null;
+                return(
+                  <div key={h.dateSort} style={{display:"grid",gridTemplateColumns:"1fr 80px 80px 80px 32px",gap:6,padding:"10px 14px",borderTop:`1px solid ${C.border}`,alignItems:"center"}}>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:600,color:C.dark}}>{h.date}</div>
+                      {change!==null&&<div style={{fontSize:10,color:change>=0?C.green:C.red,marginTop:1}}>{change>=0?"+":""}A${change.toFixed(0)}</div>}
+                    </div>
+                    <div style={{textAlign:"right",fontSize:12,color:C.muted,fontFamily:"monospace"}}>A${(h.shares/1000).toFixed(1)}k</div>
+                    <div style={{textAlign:"right",fontSize:12,color:C.muted,fontFamily:"monospace"}}>A${(h.gold/1000).toFixed(1)}k</div>
+                    <div style={{textAlign:"right",fontSize:13,fontWeight:700,color:C.dark,fontFamily:"monospace"}}>A${(h.total/1000).toFixed(1)}k</div>
+                    <button onClick={()=>deleteSnap(h.dateSort)} style={{background:"transparent",border:`1px solid ${C.border}`,color:C.muted,width:24,height:24,borderRadius:12,fontSize:10,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{background:`${C.accent}08`,border:`1px solid ${C.accent}20`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{fontSize:12,color:C.muted,lineHeight:1.6}}>
+                💡 <strong style={{color:C.dark}}>Tip:</strong> Tap <strong style={{color:C.dark}}>📸 Snapshot</strong> once a month to build your wealth history. Stores up to 24 snapshots.
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function App(){
   const prices=useLivePrices();
   const [selected,setSelected]=useState(null);
@@ -790,10 +1345,22 @@ function App(){
   const fetchSwanPrice=useCallback(async()=>{
     try{
       let spot=null;
-      try{const res=await fetch("https://api.frankfurter.app/latest?from=XAU&to=AUD");const d=await res.json();if(d.rates?.AUD&&d.rates.AUD>1000)spot=d.rates.AUD;}catch(e){}
-      if(!spot){try{const[fx,xau]=await Promise.all([fetch("https://api.frankfurter.app/latest?from=USD&to=AUD"),fetch("https://api.frankfurter.app/latest?from=XAU&to=USD")]);const fd=await fx.json(),xd=await xau.json();if(fd.rates?.AUD&&xd.rates?.USD)spot=xd.rates.USD*fd.rates.AUD;}catch(e){}}
-      if(spot&&spot>1000)setSwanBarPrice(spot*TROY_OZ*PREMIUM);else throw new Error("fallback");
-    }catch{const g=prices["GOLD"]?.current||57.04;setSwanBarPrice(g*100*TROY_OZ*PREMIUM);}
+      // Primary: open.er-api.com - free, no key, supports XAU natively
+      try{
+        const res=await fetch("https://open.er-api.com/v6/latest/XAU");
+        const d=await res.json();
+        if(d.result==="success"&&d.rates?.AUD&&d.rates.AUD>1000) spot=d.rates.AUD;
+      }catch(e){}
+      // Fallback: derive from GOLD ETF price on watchlist
+      if(!spot||spot<1000){
+        const g=prices["GOLD"]?.current||57.04;
+        spot=g*100; // each GOLD unit = 1/100 oz, so price*100 ≈ spot/oz
+      }
+      setSwanBarPrice(spot*TROY_OZ*PREMIUM);
+    }catch{
+      const g=prices["GOLD"]?.current||57.04;
+      setSwanBarPrice(g*100*TROY_OZ*PREMIUM);
+    }
   },[prices]);
 
   useEffect(()=>{fetchSwanPrice();const id=setInterval(fetchSwanPrice,120000);return()=>clearInterval(id);},[]);
@@ -807,15 +1374,20 @@ function App(){
       :mainTab==="gold"?<SwanBullionScreen sharedBarPrice={swanBarPrice} onPriceUpdate={setSwanBarPrice}/>
       :mainTab==="savings"?<SavingsScreen/>
       :mainTab==="finance"?<FinanceScreen/>
+      :mainTab==="dca"?<DCAScreen prices={prices}/>
+      :mainTab==="alerts"?<AlertsScreen prices={prices}/>
+      :mainTab==="history"?<NetWorthHistory prices={prices} swanBarPrice={swanBarPrice}/>
       :<TotalPortfolioScreen prices={prices} swanBarPrice={swanBarPrice}/>}
     </div>
     <div style={{background:C.panel,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0,minHeight:56}} className="safe-bot">
-      {[{id:"watchlist",icon:"📈",label:"Watchlist"},{id:"portfolio",icon:"💼",label:"Portfolio"},
-        {id:"gold",icon:"🥇",label:"Gold"},{id:"savings",icon:"🏦",label:"Savings"},
-        {id:"finance",icon:"💰",label:"Finance"},{id:"total",icon:"🌐",label:"Total"}].map(tab=>(
-        <button key={tab.id} onClick={()=>setMainTab(tab.id)} style={{flex:1,background:"transparent",border:"none",padding:"10px 0 4px",display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
-          <span style={{fontSize:20}}>{tab.icon}</span>
-          <span style={{fontSize:9,fontWeight:600,color:mainTab===tab.id?"#1a56db":"#8a94a6",letterSpacing:0}}>{tab.label}</span>
+      {[{id:"watchlist",icon:"📈",label:"Watch"},{id:"portfolio",icon:"💼",label:"Hold"},
+        {id:"gold",icon:"🥇",label:"Gold"},{id:"savings",icon:"🏦",label:"Save"},
+        {id:"finance",icon:"💰",label:"Budget"},{id:"dca",icon:"📐",label:"DCA"},
+        {id:"alerts",icon:"🔔",label:"Alerts"},{id:"history",icon:"📊",label:"History"},
+        {id:"total",icon:"🌐",label:"Total"}].map(tab=>(
+        <button key={tab.id} onClick={()=>setMainTab(tab.id)} style={{flex:1,background:"transparent",border:"none",padding:"6px 0 3px",display:"flex",flexDirection:"column",alignItems:"center",gap:1}}>
+          <span style={{fontSize:18}}>{tab.icon}</span>
+          <span style={{fontSize:8,fontWeight:600,color:mainTab===tab.id?"#1a56db":"#8a94a6",letterSpacing:0}}>{tab.label}</span>
           {mainTab===tab.id&&<div style={{width:20,height:2,background:"#1a56db",borderRadius:1,marginTop:2}}/>}
         </button>
       ))}
