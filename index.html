@@ -147,6 +147,92 @@ function LineChart({data,color,height=140}){
   </svg>);
 }
 
+// ── Mitrade-style full chart with candlestick bars + P&L overlay ──
+function MitradeChart({data, color, height=200, entryPrice, sym, currentPrice}){
+  const W=340, H=height;
+  const min=Math.min(...data)*0.9995;
+  const max=Math.max(...data)*1.0005;
+  const range=max-min||1;
+  const toY=v=>H-4-((v-min)/range)*(H-12);
+  const toX=i=>(i/(data.length-1))*W;
+
+  // Area path
+  const pts=data.map((v,i)=>`${toX(i)},${toY(v)}`).join(" ");
+  const gid="mg"+color.replace("#","");
+
+  // Simulated candlestick bars (group data into N bars)
+  const barCount=Math.min(30, data.length);
+  const barW=W/barCount;
+  const bars=Array.from({length:barCount},(_,i)=>{
+    const start=Math.floor(i/barCount*data.length);
+    const end=Math.floor((i+1)/barCount*data.length);
+    const slice=data.slice(start,end);
+    if(!slice.length)return null;
+    const o=slice[0],c=slice[slice.length-1];
+    const hi=Math.max(...slice),lo=Math.min(...slice);
+    return{x:toX(start+(end-start)/2),o,c,hi,lo,up:c>=o};
+  }).filter(Boolean);
+
+  // Entry price line Y
+  const entryY=entryPrice?toY(entryPrice):null;
+  const pnl=entryPrice&&currentPrice?currentPrice-entryPrice:null;
+  const pnlPct=entryPrice&&pnl?(pnl/entryPrice)*100:null;
+
+  // Grid lines (3 horizontal)
+  const gridLines=[0.25,0.5,0.75].map(p=>({y:H-4-(p*(H-12)),val:(min+range*p)}));
+
+  return(
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{display:"block"}}>
+      <defs>
+        <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.25"/>
+          <stop offset="100%" stopColor={color} stopOpacity="0.02"/>
+        </linearGradient>
+      </defs>
+
+      {/* Grid lines */}
+      {gridLines.map((g,i)=>(
+        <line key={i} x1="0" y1={g.y} x2={W} y2={g.y} stroke="#e8eaf0" strokeWidth="0.5" strokeDasharray="4,4"/>
+      ))}
+
+      {/* Area fill */}
+      <polygon points={`0,${toY(data[0])} ${pts} ${W},${H} 0,${H}`} fill={`url(#${gid})`}/>
+
+      {/* Candlestick bars */}
+      {bars.map((b,i)=>{
+        const bColor=b.up?color:"#e8334a";
+        const top=Math.min(toY(b.o),toY(b.c));
+        const bH=Math.max(Math.abs(toY(b.o)-toY(b.c)),1.5);
+        const bWidth=Math.max(barW*0.55,2);
+        return(<g key={i}>
+          <line x1={b.x} y1={toY(b.hi)} x2={b.x} y2={toY(b.lo)} stroke={bColor} strokeWidth="0.8" opacity="0.7"/>
+          <rect x={b.x-bWidth/2} y={top} width={bWidth} height={bH} fill={bColor} opacity="0.75" rx="0.5"/>
+        </g>);
+      })}
+
+      {/* Main line on top */}
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round"/>
+
+      {/* Current price dot */}
+      <circle cx={W} cy={toY(currentPrice||data[data.length-1])} r="3.5" fill={color}/>
+      <circle cx={W} cy={toY(currentPrice||data[data.length-1])} r="6" fill={color} opacity="0.2"/>
+
+      {/* Entry price line + P&L badge */}
+      {entryY&&pnl!==null&&(
+        <g>
+          <line x1="0" y1={entryY} x2={W} y2={entryY} stroke={pnl>=0?"#00a86b":"#e8334a"} strokeWidth="1" strokeDasharray="5,3" opacity="0.8"/>
+          {/* P&L badge */}
+          <rect x={W-110} y={entryY-(pnl>=0?22:4)} width={108} height={22} rx="4"
+            fill={pnl>=0?"#00a86b":"#e8334a"} opacity="0.92"/>
+          <text x={W-56} y={entryY+(pnl>=0?-6:12)} textAnchor="middle" fontSize="9" fontWeight="700" fill="#fff">
+            {pnl>=0?"+":""}{sym}{Math.abs(pnl).toFixed(2)} ({pnlPct>=0?"+":""}{pnlPct.toFixed(2)}%)
+          </text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
 function WatchlistScreen({prices,onSelect}){
   return(<div style={{background:C.bg,minHeight:"100%",paddingBottom:20}}>
     <div style={{background:C.panel,padding:"16px 20px 12px",borderBottom:`1px solid ${C.border}`}} className="safe-top">
@@ -226,12 +312,34 @@ function StockDetail({tickerId,prices,onBack}){
     </div>
     {innerTab==="overview"&&(<div>
       <div style={{background:C.panel,padding:"16px",marginBottom:8,marginTop:8}}>
-        <div style={{fontWeight:600,fontSize:13,color:C.dark,marginBottom:12}}>Price History</div>
-        <LineChart data={chartData} color={up?C.green:C.red} height={140}/>
-        <div style={{display:"flex",justifyContent:"space-around",marginTop:12,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+        {/* Entry price P&L context */}
+        {(()=>{
+          const holdings=JSON.parse(localStorage.getItem("cmc_holdings")||"[]");
+          const myHolding=holdings.find(h=>h.ticker===t.id);
+          return myHolding?(
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:11,color:C.muted}}>Your entry: <strong style={{color:C.dark,fontFamily:"monospace"}}>A${myHolding.avgCost.toFixed(3)}</strong></div>
+              <div style={{fontSize:11,fontWeight:600,color:(p.current-myHolding.avgCost)>=0?C.green:C.red}}>
+                {(p.current-myHolding.avgCost)>=0?"+":""}A${(p.current-myHolding.avgCost).toFixed(3)} ({((p.current-myHolding.avgCost)/myHolding.avgCost*100).toFixed(2)}%)
+              </div>
+            </div>
+          ):null;
+        })()}
+        <MitradeChart
+          data={chartData}
+          color={up?C.green:C.red}
+          height={200}
+          currentPrice={p.current}
+          sym="A$"
+          entryPrice={(()=>{const h=JSON.parse(localStorage.getItem("cmc_holdings")||"[]");const m=h.find(x=>x.ticker===t.id);return m?.avgCost||null;})()}
+        />
+        <div style={{display:"flex",justifyContent:"space-around",marginTop:10,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
           {["1D","5D","1M","6M","1Y"].map(r=>(
-            <button key={r} onClick={()=>setChartRange(r)} style={{background:chartRange===r?C.dark:"transparent",border:"none",
-              color:chartRange===r?"#fff":C.muted,padding:"5px 12px",borderRadius:20,fontSize:12,fontWeight:chartRange===r?700:400}}>{r}</button>
+            <button key={r} onClick={()=>setChartRange(r)} style={{
+              background:chartRange===r?C.dark:"transparent",border:"none",
+              color:chartRange===r?"#fff":C.muted,
+              padding:"6px 14px",borderRadius:20,fontSize:12,fontWeight:chartRange===r?700:400,
+            }}>{r}</button>
           ))}
         </div>
       </div>
